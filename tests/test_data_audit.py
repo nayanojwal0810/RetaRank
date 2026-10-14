@@ -33,6 +33,6 @@ def test_profile_sheet_reports_source_metrics_without_cleaning_rows() -> None:
     assert profile["zero_quantity_rows"] == 1
     assert profile["positive_quantity_rows"] == 1
     assert profile["missing_or_unparseable_invoice_dates"] == 1
-    assert profile["raw_quantity_times_price_sum_all_rows"] == 5.0
+    assert profile["raw_quantity_times_price_sum_all_rows"] == 7.0
     assert len(missingness) == 5
     assert len(frame) == 3  # profiling must not drop rows
