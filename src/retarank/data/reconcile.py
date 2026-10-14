@@ -119,6 +119,20 @@ def generate_deduplication_sensitivity_report(ledger: pd.DataFrame) -> pd.DataFr
         valid_purchase_lines = df[df["is_valid_merchandise_purchase"]]
         valid_return_lines = df[df["is_valid_customer_return"]]
 
+        # Distinct customer-invoice purchase events
+        # In Online Retail II, every invoice is tied to at most 1 customer (0 multi-customer invoices).
+        # We explicitly calculate distinct (customer_id, invoice) pairs to guarantee exact definition adherence.
+        cust_inv_purchase_events = int(
+            valid_purchase_lines.groupby(["parsed_customer_id", "parsed_invoice"]).ngroups
+        ) if not valid_purchase_lines.empty else 0
+
+        # Storewide commercial sales invoices (positive quantity, positive price, non-cancellation)
+        comm_invoices = int(
+            df[(df["parsed_quantity"] > 0) & (df["parsed_price"] > 0) & (~df["is_cancellation"])]["parsed_invoice"]
+            .dropna()
+            .nunique()
+        )
+
         return {
             "specification": label,
             "row_count": len(df),
@@ -131,9 +145,11 @@ def generate_deduplication_sensitivity_report(ledger: pd.DataFrame) -> pd.DataFr
             "anonymous_sum": round(float(anon_lines["raw_line_amount"].sum()), 2),
             "distinct_customers": int(df["parsed_customer_id"].dropna().nunique()),
             "distinct_invoices": int(df["parsed_invoice"].dropna().nunique()),
+            "commercial_positive_invoices": comm_invoices,
             "valid_merchandise_purchase_lines": len(valid_purchase_lines),
+            "distinct_invoices_with_valid_merchandise": int(valid_purchase_lines["parsed_invoice"].dropna().nunique()),
+            "customer_invoice_purchase_events": cust_inv_purchase_events,
             "valid_purchase_customers": int(valid_purchase_lines["parsed_customer_id"].dropna().nunique()),
-            "valid_purchase_events": int(valid_purchase_lines["parsed_invoice"].dropna().nunique()),
             "valid_customer_return_lines": len(valid_return_lines),
             "valid_customer_return_events": int(valid_return_lines["parsed_invoice"].dropna().nunique()),
         }
@@ -153,9 +169,11 @@ def generate_deduplication_sensitivity_report(ledger: pd.DataFrame) -> pd.DataFr
         "anonymous_sum": round(res_a["anonymous_sum"] - res_b["anonymous_sum"], 2),
         "distinct_customers": res_a["distinct_customers"] - res_b["distinct_customers"],
         "distinct_invoices": res_a["distinct_invoices"] - res_b["distinct_invoices"],
+        "commercial_positive_invoices": res_a["commercial_positive_invoices"] - res_b["commercial_positive_invoices"],
         "valid_merchandise_purchase_lines": res_a["valid_merchandise_purchase_lines"] - res_b["valid_merchandise_purchase_lines"],
+        "distinct_invoices_with_valid_merchandise": res_a["distinct_invoices_with_valid_merchandise"] - res_b["distinct_invoices_with_valid_merchandise"],
+        "customer_invoice_purchase_events": res_a["customer_invoice_purchase_events"] - res_b["customer_invoice_purchase_events"],
         "valid_purchase_customers": res_a["valid_purchase_customers"] - res_b["valid_purchase_customers"],
-        "valid_purchase_events": res_a["valid_purchase_events"] - res_b["valid_purchase_events"],
         "valid_customer_return_lines": res_a["valid_customer_return_lines"] - res_b["valid_customer_return_lines"],
         "valid_customer_return_events": res_a["valid_customer_return_events"] - res_b["valid_customer_return_events"],
     }
@@ -163,13 +181,18 @@ def generate_deduplication_sensitivity_report(ledger: pd.DataFrame) -> pd.DataFr
     return pd.DataFrame([res_a, res_b, diff])
 
 
-def generate_transaction_classification_report(ledger: pd.DataFrame) -> pd.DataFrame:
+def generate_transaction_classification_report(
+    ledger: pd.DataFrame,
+    specification_label: str | None = None,
+) -> pd.DataFrame:
     """Produce exhaustive mutually exclusive transaction classification profile.
 
     Parameters
     ----------
     ledger : pd.DataFrame
         Canonical raw transaction ledger.
+    specification_label : str | None, optional
+        Label indicating transaction specification (e.g. Specification A or B).
 
     Returns
     -------
@@ -198,7 +221,7 @@ def generate_transaction_classification_report(ledger: pd.DataFrame) -> pd.DataF
     grouped = ledger.groupby("classification_category", dropna=False)
     for cat_name, group in grouped:
         count = len(group)
-        pct = round(count / total_rows * 100.0, 4)
+        pct = round(count / total_rows * 100.0, 4) if total_rows > 0 else 0.0
         qty_sum = int(group["parsed_quantity"].sum())
         line_sum = round(float(group["raw_line_amount"].sum()), 2)
         pos_p_count = int((group["parsed_price"] > 0).sum())
@@ -227,16 +250,38 @@ def generate_transaction_classification_report(ledger: pd.DataFrame) -> pd.DataF
         })
 
     df_out = pd.DataFrame(records).sort_values("row_count", ascending=False).reset_index(drop=True)
+    if specification_label is not None:
+        df_out.insert(0, "specification", specification_label)
+
+    # Automated assertions: category row counts and signed sums must reconcile exactly
+    assert df_out["row_count"].sum() == total_rows, (
+        f"Classification row count ({df_out['row_count'].sum()}) does not match ledger rows ({total_rows})"
+    )
+    raw_sum = round(float(ledger["raw_line_amount"].sum()), 2)
+    cat_sum = round(float(df_out["signed_line_amount_sum"].sum()), 2)
+    assert np.isclose(cat_sum, raw_sum, atol=1e-2), (
+        f"Classification signed amount ({cat_sum}) does not match ledger line amount ({raw_sum})"
+    )
+
+    # Automated assertion: every category must belong to recognized taxonomy
+    unknown_cats = set(df_out["classification_category"]) - set(category_descriptions.keys())
+    assert not unknown_cats, f"Unrecognized classification categories detected: {unknown_cats}"
+
     return df_out
 
 
-def generate_monetary_reconciliation_report(ledger: pd.DataFrame) -> pd.DataFrame:
+def generate_monetary_reconciliation_report(
+    ledger: pd.DataFrame,
+    specification_label: str | None = None,
+) -> pd.DataFrame:
     """Prove mathematical equality of financial arithmetic across independent partitions.
 
     Parameters
     ----------
     ledger : pd.DataFrame
         Canonical raw transaction ledger.
+    specification_label : str | None, optional
+        Label indicating transaction specification (e.g. Specification A or B).
 
     Returns
     -------
@@ -277,13 +322,13 @@ def generate_monetary_reconciliation_report(ledger: pd.DataFrame) -> pd.DataFram
     p4_diff = round(p4_sum - total_raw_amount, 2)
 
     # Partition 5: Classification Categories
-    cat_sum = round(float(ledger.groupby("classification_category")["raw_line_amount"].sum().sum()), 2)
+    cat_sum = round(float(ledger.groupby("classification_category", dropna=False)["raw_line_amount"].sum().sum()), 2)
     p5_diff = round(cat_sum - total_raw_amount, 2)
 
     rows = [
         {
             "partition_name": "Target: Total Raw Line Amount",
-            "component": "All Rows (1,067,371)",
+            "component": f"All Rows ({total_rows:,})",
             "amount": total_raw_amount,
             "reconciled_sum": total_raw_amount,
             "residual_diff": 0.00,
@@ -355,7 +400,7 @@ def generate_monetary_reconciliation_report(ledger: pd.DataFrame) -> pd.DataFram
         },
         {
             "partition_name": "Partition 4: Worksheets",
-            "component": f"{sheets[0]}",
+            "component": f"{sheets[0]}" if len(sheets) > 0 else "Sheet 1",
             "amount": s1_amt,
             "reconciled_sum": p4_sum,
             "residual_diff": p4_diff,
@@ -363,7 +408,7 @@ def generate_monetary_reconciliation_report(ledger: pd.DataFrame) -> pd.DataFram
         },
         {
             "partition_name": "Partition 4: Worksheets",
-            "component": f"{sheets[1]}",
+            "component": f"{sheets[1]}" if len(sheets) > 1 else "Sheet 2",
             "amount": s2_amt,
             "reconciled_sum": p4_sum,
             "residual_diff": p4_diff,
@@ -379,7 +424,17 @@ def generate_monetary_reconciliation_report(ledger: pd.DataFrame) -> pd.DataFram
         },
     ]
 
-    return pd.DataFrame(rows)
+    df_out = pd.DataFrame(rows)
+    if specification_label is not None:
+        df_out.insert(0, "specification", specification_label)
+
+    # Automated assertions: zero residual across all partitions
+    unreconciled = df_out[df_out["residual_diff"] != 0.0]
+    assert unreconciled.empty, (
+        f"Unreconciled partitions detected:\n{unreconciled[['partition_name', 'component', 'residual_diff']]}"
+    )
+
+    return df_out
 
 
 def run_reconciliation_pipeline(
@@ -425,13 +480,28 @@ def run_reconciliation_pipeline(
     dedup_sens_file = metrics_path / "deduplication_sensitivity.csv"
     dedup_sens_df.to_csv(dedup_sens_file, index=False)
 
-    logger.info("Generating transaction classification report...")
-    trans_class_df = generate_transaction_classification_report(ledger)
+    logger.info("Generating transaction classification report (Spec A and Spec B)...")
+    spec_a = ledger
+    spec_b = get_deduplicated_ledger(ledger, specification="B")
+
+    trans_class_a = generate_transaction_classification_report(
+        spec_a, specification_label="Specification A (Retained duplicates)"
+    )
+    trans_class_b = generate_transaction_classification_report(
+        spec_b, specification_label="Specification B (Primary deduplicated)"
+    )
+    trans_class_df = pd.concat([trans_class_a, trans_class_b], ignore_index=True)
     trans_class_file = metrics_path / "transaction_classification.csv"
     trans_class_df.to_csv(trans_class_file, index=False)
 
-    logger.info("Generating monetary reconciliation report...")
-    recon_df = generate_monetary_reconciliation_report(ledger)
+    logger.info("Generating monetary reconciliation report (Spec A and Spec B)...")
+    recon_a = generate_monetary_reconciliation_report(
+        spec_a, specification_label="Specification A (Retained duplicates)"
+    )
+    recon_b = generate_monetary_reconciliation_report(
+        spec_b, specification_label="Specification B (Primary deduplicated)"
+    )
+    recon_df = pd.concat([recon_a, recon_b], ignore_index=True)
     recon_file = metrics_path / "transaction_reconciliation.csv"
     recon_df.to_csv(recon_file, index=False)
 

@@ -205,23 +205,38 @@ def test_deduplication_sensitivity_metrics(synthetic_multi_sheet_ledger: pd.Data
     assert row_b["distinct_invoices"] == 6
     assert diff["distinct_invoices"] == 0
 
+    # Separate, unambiguous event counts:
+    # Storewide commercial positive invoices (101, 104, 105)
+    assert row_a["commercial_positive_invoices"] == 3
+    assert row_b["commercial_positive_invoices"] == 3
+    assert diff["commercial_positive_invoices"] == 0
+
+    # Distinct invoices with valid merchandise purchases (101, 104)
+    assert row_a["distinct_invoices_with_valid_merchandise"] == 2
+    assert row_b["distinct_invoices_with_valid_merchandise"] == 2
+    assert diff["distinct_invoices_with_valid_merchandise"] == 0
+
+    # Distinct customer-invoice purchase events ((1001, 101), (2002, 104))
+    assert row_a["customer_invoice_purchase_events"] == 2
+    assert row_b["customer_invoice_purchase_events"] == 2
+    assert diff["customer_invoice_purchase_events"] == 0
+
+    # Valid purchase customers (1001, 2002)
+    assert row_a["valid_purchase_customers"] == 2
+    assert row_b["valid_purchase_customers"] == 2
+    assert diff["valid_purchase_customers"] == 0
+
+    # Merchandise purchase lines: drops duplicates (row 1 and row 6)
+    assert row_a["valid_merchandise_purchase_lines"] == 5
+    assert row_b["valid_merchandise_purchase_lines"] == 3
+    assert diff["valid_merchandise_purchase_lines"] == 2
+
 
 def test_monetary_reconciliation_exact_zero_residual(synthetic_multi_sheet_ledger: pd.DataFrame) -> None:
     ledger = synthetic_multi_sheet_ledger
     recon_df = generate_monetary_reconciliation_report(ledger)
 
-    # Total raw line amount in synthetic dataset:
-    # Row 0: 2 * 10 = 20
-    # Row 1: 2 * 10 = 20
-    # Row 2: 1 * 5 = 5 (POST)
-    # Row 3: -1 * 10 = -10 (C102)
-    # Row 4: -5 * 0 = 0 (damage)
-    # Row 5: 4 * 2.5 = 10 (Cup)
-    # Row 6: 4 * 2.5 = 10 (Cup copy)
-    # Row 7: 1 * 8 = 8 (Plate)
-    # Row 8: 3 * 4 = 12 (Lantern)
-    # Row 9: 1 * -50 = -50 (Bad debt)
-    # Total sum = 20 + 20 + 5 - 10 + 0 + 10 + 10 + 8 + 12 - 50 = 25.0
+    # Total raw line amount in synthetic dataset: 25.0
     target_row = recon_df[recon_df["partition_name"].str.contains("Target")].iloc[0]
     assert target_row["amount"] == 25.0
 
@@ -229,10 +244,31 @@ def test_monetary_reconciliation_exact_zero_residual(synthetic_multi_sheet_ledge
     assert (recon_df["status"] == "EXACT").all()
     assert (recon_df["residual_diff"] == 0.00).all()
 
+    # Spec B monetary reconciliation
+    spec_b = get_deduplicated_ledger(ledger, specification="B")
+    recon_b = generate_monetary_reconciliation_report(spec_b, specification_label="Specification B")
+    assert (recon_b["status"] == "EXACT").all()
+    assert (recon_b["residual_diff"] == 0.00).all()
+
+
+def test_reconciliation_assertions_fail_on_tampered_data(synthetic_multi_sheet_ledger: pd.DataFrame) -> None:
+    """Ensure automated assertions prevent unclassified or mismatched financial totals."""
+    corrupted_ledger = synthetic_multi_sheet_ledger.copy()
+    # Missing price in partition calculation triggers non-zero residual
+    corrupted_ledger.loc[0, "parsed_price"] = np.nan
+    with pytest.raises(AssertionError):
+        generate_monetary_reconciliation_report(corrupted_ledger)
+
+    # Tampering with classification category triggers taxonomy violation
+    corrupted_cat = synthetic_multi_sheet_ledger.copy()
+    corrupted_cat.loc[0, "classification_category"] = "UNAUTHORIZED_CATEGORY"
+    with pytest.raises(AssertionError):
+        generate_transaction_classification_report(corrupted_cat)
+
 
 def test_exhaustive_transaction_classification(synthetic_multi_sheet_ledger: pd.DataFrame) -> None:
     ledger = synthetic_multi_sheet_ledger
-    class_df = generate_transaction_classification_report(ledger)
+    class_df = generate_transaction_classification_report(ledger, specification_label="Specification A")
 
     # Sum of row counts must match 100% of rows (10)
     assert class_df["row_count"].sum() == 10
@@ -247,6 +283,12 @@ def test_exhaustive_transaction_classification(synthetic_multi_sheet_ledger: pd.
     assert "INVENTORY_ADJUSTMENT_ZERO_PRICE" in categories
     assert "PURCHASE_ANONYMOUS_MERCHANDISE" in categories
     assert "BAD_DEBT_NEGATIVE_PRICE" in categories
+
+    # Also test Spec B classification
+    spec_b = get_deduplicated_ledger(ledger, specification="B")
+    class_b = generate_transaction_classification_report(spec_b, specification_label="Specification B")
+    assert class_b["row_count"].sum() == 8
+    assert round(class_b["signed_line_amount_sum"].sum(), 2) == round(float(spec_b["raw_line_amount"].sum()), 2)
 
 
 def test_non_destructive_input_behaviour(synthetic_multi_sheet_ledger: pd.DataFrame) -> None:
@@ -268,27 +310,85 @@ def test_non_destructive_input_behaviour(synthetic_multi_sheet_ledger: pd.DataFr
     reason="Actual Online Retail II Excel workbook not present",
 )
 def test_real_workbook_integration_reconciliation() -> None:
-    """Real-data integration check verifying exact zero residual on the actual workbook."""
-    from retarank.config import RAW_DATA_DIR
-    from retarank.data.clean import build_canonical_ledger
+    """Real-data integration check verifying exact zero residual and full reconciliation on the actual workbook."""
+    from retarank.config import PROCESSED_DATA_DIR, RAW_DATA_DIR
+    from retarank.data.clean import build_canonical_ledger, get_deduplicated_ledger
     from retarank.data.reconcile import (
         generate_deduplication_sensitivity_report,
         generate_monetary_reconciliation_report,
+        generate_transaction_classification_report,
     )
 
-    ledger = build_canonical_ledger(RAW_DATA_DIR / "online_retail_II.xlsx")
+    source_path = RAW_DATA_DIR / "online_retail_II.xlsx"
+    initial_size = source_path.stat().st_size
+
+    parquet_with_dups = PROCESSED_DATA_DIR / "transactions_with_duplicates.parquet"
+    if parquet_with_dups.exists():
+        ledger = pd.read_parquet(parquet_with_dups)
+    else:
+        ledger = build_canonical_ledger(source_path)
+
     assert len(ledger) == 1067371
     assert ledger["source_row_id"].nunique() == 1067371
 
-    # Exact zero residual proof
-    recon_df = generate_monetary_reconciliation_report(ledger)
-    assert (recon_df["status"] == "EXACT").all()
-    assert (recon_df["residual_diff"] == 0.00).all()
+    # Verify source workbook has not been modified
+    assert source_path.stat().st_size == initial_size
 
-    # Deduplication integrity
+    # Verify multi-customer invoice check: 0 invoices link to more than 1 customer
+    cust_per_inv = ledger[ledger["has_customer_id"]].groupby("parsed_invoice")["parsed_customer_id"].nunique()
+    assert (cust_per_inv == 1).all()
+    mixed_invoices = set(ledger[ledger["has_customer_id"]]["parsed_invoice"]).intersection(
+        set(ledger[~ledger["has_customer_id"]]["parsed_invoice"])
+    )
+    assert len(mixed_invoices) == 0
+
+    # Exact zero residual proof for Specification A
+    recon_a = generate_monetary_reconciliation_report(ledger, specification_label="Specification A")
+    assert (recon_a["status"] == "EXACT").all()
+    assert (recon_a["residual_diff"] == 0.00).all()
+    assert recon_a[recon_a["partition_name"].str.contains("Target")].iloc[0]["amount"] == 19287250.57
+
+    # Exact zero residual proof for Specification B
+    spec_b = get_deduplicated_ledger(ledger, specification="B")
+    assert len(spec_b) == 1033036
+    recon_b = generate_monetary_reconciliation_report(spec_b, specification_label="Specification B")
+    assert (recon_b["status"] == "EXACT").all()
+    assert (recon_b["residual_diff"] == 0.00).all()
+    assert recon_b[recon_b["partition_name"].str.contains("Target")].iloc[0]["amount"] == 18855533.70
+
+    # Transaction classifications reconcile to ledger totals exactly
+    class_a = generate_transaction_classification_report(ledger, specification_label="Specification A")
+    assert class_a["row_count"].sum() == 1067371
+    assert round(class_a["signed_line_amount_sum"].sum(), 2) == 19287250.57
+
+    class_b = generate_transaction_classification_report(spec_b, specification_label="Specification B")
+    assert class_b["row_count"].sum() == 1033036
+    assert round(class_b["signed_line_amount_sum"].sum(), 2) == 18855533.70
+
+    # Deduplication integrity & metric invariants
     sens_df = generate_deduplication_sensitivity_report(ledger)
+    row_a = sens_df[sens_df["specification"].str.contains("Specification A")].iloc[0]
+    row_b = sens_df[sens_df["specification"].str.contains("Specification B")].iloc[0]
     diff_row = sens_df[sens_df["specification"].str.contains("Difference")].iloc[0]
+
     assert diff_row["row_count"] == 34335
     assert diff_row["distinct_customers"] == 0
     assert diff_row["distinct_invoices"] == 0
+    assert diff_row["commercial_positive_invoices"] == 0
+    assert diff_row["distinct_invoices_with_valid_merchandise"] == 0
+    assert diff_row["customer_invoice_purchase_events"] == 0
+    assert diff_row["valid_purchase_customers"] == 0
+    assert diff_row["valid_customer_return_events"] == 0
+
+    # Confirm key distinct counts
+    assert row_a["distinct_customers"] == 5942
+    assert row_a["distinct_invoices"] == 53628
+    assert row_a["commercial_positive_invoices"] == 40077
+    assert row_a["distinct_invoices_with_valid_merchandise"] == 36613
+    assert row_a["customer_invoice_purchase_events"] == 36613
+    assert row_a["valid_purchase_customers"] == 5853
+    assert row_a["valid_customer_return_events"] == 7290
+    assert row_a["valid_merchandise_purchase_lines"] == 802900
+    assert row_b["valid_merchandise_purchase_lines"] == 776840
+    assert diff_row["valid_merchandise_purchase_lines"] == 26060
 
