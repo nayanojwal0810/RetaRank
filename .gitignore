@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local configuration / secrets
+.env
+.env.*
+!.env.example
+
+# Data files: keep raw and generated datasets out of Git
+data/raw/*
+data/interim/*
+data/processed/*
+!data/raw/.gitkeep
+!data/interim/.gitkeep
+!data/processed/.gitkeep
+
+# Generated outputs; commit only explicitly selected final artifacts
+outputs/metrics/*
+outputs/tables/*
+outputs/figures/*
+!outputs/metrics/.gitkeep
+!outputs/tables/.gitkeep
+!outputs/figures/.gitkeep
+
+# Power BI binaries and local caches
+*.pbix
+*.pbit
+powerbi/data/*
+!powerbi/data/.gitkeep
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
