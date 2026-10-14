@@ -1,0 +1,10 @@
+# Initial project dependencies; pin exact versions after the first verified environment build.
+pandas
+numpy
+openpyxl
+scikit-learn
+scipy
+matplotlib
+seaborn
+jupyter
+pytest
